@@ -98,6 +98,10 @@ def welcome(member):                 # someone joined the server
 def got(message):                    # someone sent a file
     print(message.file["name"], message.file["size"], message.body)
 
+@bot.on_reaction
+def reacted(reaction):               # someone put an emoji under a message
+    print(reaction["sender"], reaction["emoji"], reaction["target"])
+
 @bot.on_profile
 def changed(user_id, profile):       # someone's profile reached the bot, new or changed
     print(profile.get("birthday"))

@@ -164,6 +164,7 @@ class Bot:
         self._file_handlers = []
         self._joiners = []
         self._profile_handlers = []
+        self._reaction_handlers = []
         self._controls = collections.OrderedDict()   # what can be seen and changed from the app
         self._event_handlers = []
         self._offers = {}                            # what other bots may ask this one for
@@ -205,6 +206,15 @@ class Bot:
         """@bot.on_file def got(message): ...   Called for every file someone
         else sends; message.file has its name, size and kind, message.body its caption."""
         self._file_handlers.append(fn)
+        return fn
+
+    def on_reaction(self, fn):
+        """@bot.on_reaction def reacted(reaction): ...   Called when someone
+        else puts an emoji under a message. reaction has "emoji", "target"
+        (the id of the message it is under), "room_id", "sender_id",
+        "sender" (their username) and "event_id". Other bots' reactions are
+        not passed on, like their messages."""
+        self._reaction_handlers.append(fn)
         return fn
 
     def on_profile(self, fn):
@@ -791,6 +801,17 @@ class Bot:
                 if kind_of.startswith("m.bot.") and not data.get("mine") and not data.get("shared_history"):
                     if not self._stale(data):
                         threading.Thread(target=self._guard, args=(self._managed, data), daemon=True).start()
+                    continue
+                if kind_of == "m.reaction" and self._reaction_handlers and not data.get("mine") \
+                        and not data.get("shared_history") and data.get("status") != "redacted" and not self._stale(data):
+                    relation = data.get("relation") or {}
+                    if self.hear_bots or not self.members().get(data.get("sender_user", ""), {}).get("bot"):
+                        reaction = {"emoji": relation.get("key") or (data.get("content") or {}).get("key", ""),
+                                    "target": relation.get("target", ""), "room_id": data.get("room_id", ""),
+                                    "sender_id": data.get("sender_user", ""), "sender": data.get("sender_username", ""),
+                                    "event_id": data.get("event_id", "")}
+                        for fn in self._reaction_handlers:
+                            threading.Thread(target=self._guard, args=(fn, reaction), daemon=True).start()
                     continue
                 if data.get("shared_history") or kind_of not in ("m.text", "m.file"):
                     continue

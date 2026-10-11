@@ -233,6 +233,23 @@ def main():
         assert not refused["ok"] and refused["message"] == "only for alice" and "file" not in refused
         unknown = asking.ask_bot("managed", "moon", timeout=40)
         assert not unknown["ok"] and "do not offer" in unknown["message"]
+        # A reaction someone puts under a message reaches a bot that asked for them.
+        import types
+        reactions = []
+        watcher = Bot(vault=os.path.join(tmp, "watcher"), username="watcher")
+        watcher.on_reaction(reactions.append)
+        watcher.connect(address)
+        threading.Thread(target=watcher.run, daemon=True).start()
+        time.sleep(3)
+        said = alice.say("#general", "react to this")
+        alice.react(types.SimpleNamespace(room_id=alice.room_id("#general"), event_id=said["event_id"]), "❌")
+        for _ in range(60):
+            if reactions:
+                break
+            time.sleep(0.2)
+        assert reactions and reactions[0]["emoji"] == "❌" and reactions[0]["target"] == said["event_id"] \
+            and reactions[0]["sender"] == "alice", reactions
+        print("ok  reactions: one put under a message reaches the bot, with who and under what")
         print("ok  bots asking bots: asked for a named person, answered once, with a file; refused by the other's own rules")
         print("PASS")
     finally:
