@@ -94,6 +94,8 @@ def find_cli():
     here = os.path.dirname(os.path.abspath(__file__))
     for candidate in (os.environ.get("CORDED_CLI", ""),
                       os.path.join(here, "..", "build", "dev", "bin", "corded-cli"),
+                      os.path.join(here, "..", "..", "corded", "build", "dev", "bin", "corded-cli"),
+                      os.path.join(here, "..", "..", "corded-cli"),
                       os.path.join(here, "..", "corded-cli"),
                       os.path.join(here, "..", "corded-cli.exe"),
                       os.path.join(here, "corded-cli")):
