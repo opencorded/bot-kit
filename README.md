@@ -110,6 +110,54 @@ first run are not counted as joining, and other bots never are.
 A bot does not hear other bots (two answering each other would never stop);
 `Bot(..., hear_bots=True)` changes that.
 
+## Letting people manage your bot from the app
+
+In the app, tapping a bot in the members list offers **Manage**: a page with
+the bot's settings as real controls. The bot says what goes on that page, in
+a few lines:
+
+```python
+bot.version = "1.0"
+bot.setting("limit", "number", "Pictures per person in ten minutes",
+            get=lambda: bot.store.get("limit", 5),
+            set=lambda v: (bot.store.__setitem__("limit", v), bot.store.save()),
+            min=0, max=100, help="0 means no limit")
+bot.setting("mode", "choice", "Adult pictures", options=["off", "nsfw"], get=..., set=...)
+bot.setting("where", "channels", "Channels it works in", get=..., set=...)
+bot.action("restart", "Restart", run=restart, needs="owner", confirm="Restart the bot?")
+bot.permission("use", "May ask for pictures")       # a permission of the bot's own
+bot.info("made", "Pictures made", get=lambda: str(count))
+
+if not bot.allowed(message.sender_id, "use"):
+    return "You may not ask me for pictures."
+```
+
+Kinds of setting: `number` (`min`, `max`), `switch`, `choice` (`options`),
+`text`, `channels`. A setting without `set` is shown and cannot be changed.
+`needs` says who may change a control: `"manage_bots"` (the owner and those
+whose role has Manage bots; what you get if you say nothing), `"owner"`,
+`"everyone"`, any server permission by name, or the key of a permission the
+bot made with `permission()`. A permission's page entry lets those who manage
+bots choose which roles hold it; `bot.allowed(user_id, key)` asks. On and off
+are on every bot's page without your doing anything.
+
+How it travels, for anyone writing another client: everything is an ordinary
+encrypted event in the direct chat between one person and the bot, so the
+server relays it without knowing what it is.
+
+| Event | From | Content |
+|---|---|---|
+| `m.bot.describe` | the person | nothing |
+| `m.bot.description` | the bot | `v`, `name`, `title`, `about`, `version`, `controls` |
+| `m.bot.set` | the person | `key`, `value` |
+| `m.bot.act` | the person | `key` |
+| `m.bot.result` | the bot | `ok`, `message`, `key`; a fresh description follows |
+
+A control is `{key, type, label, help, value, can_change}` plus what its type
+needs (`min`, `max`, `options`). What a person is shown depends on who they
+are, and **the bot checks every change itself**: a client that sends a change
+it should not is told no.
+
 ## Where the kit looks for `corded-cli`
 
 `CORDED_CLI` if it is set; then beside the kit and one folder up (a Corded

@@ -164,6 +164,9 @@ class Bot:
         self._file_handlers = []
         self._joiners = []
         self._profile_handlers = []
+        self._controls = collections.OrderedDict()   # what can be seen and changed from the app
+        self._event_handlers = []
+        self.version = ""                            # shown on the bot's page in the app, if set
         self._timers = []
         self._power_handlers = []
         self._lock = threading.Lock()
@@ -286,6 +289,185 @@ class Bot:
             if info.get("title") == room:
                 return rid
         raise KeyError(f"no room called {room!r}; known: {sorted(r.get('title', '') for r in self.rooms.values())}")
+
+    # ---- being managed from the app ----
+    #
+    # In the app, tapping a bot offers Manage: a page drawn from what the bot
+    # says about itself. It asks in the direct chat between that person and
+    # the bot (m.bot.describe), the bot answers with its controls and their
+    # values as that person may see them (m.bot.description), and a change
+    # comes back as m.bot.set or m.bot.act. All of it is encrypted like any
+    # message; the server relays it without knowing what it is. Who may
+    # change what is checked here, in the bot, every time.
+
+    def setting(self, key, kind, label, get, set=None, help="", needs="manage_bots", **more):
+        """A value shown on the bot's page. kind: "number" (min=, max=),
+        "switch", "choice" (options=[...]), "text", or "channels" (a list of
+        room ids). get() returns the value now; set(value) changes it, and
+        without one the value is only shown. needs: who may change it:
+        "manage_bots" (the owner and those with that permission), "owner",
+        "everyone", any other server permission by name, or the key of a
+        permission this bot made with permission()."""
+        self._controls[key] = dict(more, key=key, type=kind, label=label, help=help, get=get, set=set, needs=needs)
+
+    def action(self, key, label, run, help="", needs="manage_bots", confirm=""):
+        """A button on the bot's page. run() may return words to show.
+        confirm: a question the app asks before pressing it for real."""
+        self._controls[key] = dict(key=key, type="action", label=label, help=help, run=run, needs=needs, confirm=confirm)
+
+    def info(self, key, label, get, help=""):
+        """A line the bot shows about itself and nobody changes: a count, its uptime, its last error."""
+        self._controls[key] = dict(key=key, type="info", label=label, help=help, get=get, set=None, needs="nobody")
+
+    def permission(self, key, label, help="", default="everyone"):
+        """A permission of the bot's own, like "may ask for pictures": on its
+        page the roles that hold it are chosen (by those who manage bots).
+        default: "everyone", or "nobody" (then only the owner and those who
+        manage bots, until roles are chosen). Ask with allowed()."""
+        held = self.store.setdefault("permissions", {})
+        if key not in held:
+            held[key] = ["@everyone"] if default == "everyone" else []
+
+        def choose(roles):
+            self.store["permissions"][key] = [str(r) for r in roles][:50]
+            self.store.save()
+        self._controls["permission:" + key] = dict(
+            key="permission:" + key, type="roles", label=label, help=help, needs="manage_bots",
+            get=lambda: list(self.store["permissions"].get(key, [])), set=choose)
+
+    def allowed(self, user_id, key):
+        """Whether someone holds a permission made with permission(): through
+        one of their roles, or by being the owner or one who manages bots."""
+        held = set((self.store.get("permissions") or {}).get(key, []))
+        if "@everyone" in held:
+            return True
+        member = self._member(user_id)
+        if not member:
+            return False
+        return bool(member.get("is_owner")) or "manage_bots" in member.get("permissions", []) \
+            or bool(held & set(member.get("roles", [])))
+
+    def on_event(self, prefix):
+        """@bot.on_event("m.bot.") def got(data): ...   Called with the raw
+        event for types that start with prefix, in a direct chat. For
+        programs that talk to bots the way the app does."""
+        def register(fn):
+            self._event_handlers.append((prefix, fn))
+            return fn
+        return register
+
+    def _member(self, user_id):
+        try:
+            members = self.request({"cmd": "member_list"})["members"]
+        except RuntimeError:
+            members = list(self.members().values())
+        return next((m for m in members if m.get("user_id") == user_id), None)
+
+    def _can(self, member, needs):
+        if needs == "everyone":
+            return True
+        if not member or needs == "nobody":
+            return False
+        if member.get("is_owner"):
+            return True
+        if needs == "owner":
+            return False
+        if needs in (self.store.get("permissions") or {}):
+            return self.allowed(member.get("user_id", ""), needs)
+        return needs in member.get("permissions", [])
+
+    def _describe(self, member):
+        """The bot's page as one person may see it."""
+        controls = [{"key": "power", "type": "switch", "label": "On",
+                     "help": "Off, it stays connected but shows as offline and does nothing.",
+                     "value": self.enabled, "can_change": self._can(member, "manage_bots")}]
+        roles = None
+        for key, c in self._controls.items():
+            shown = {k: v for k, v in c.items() if k not in ("get", "set", "run", "needs")}
+            if c["type"] != "action":
+                try:
+                    shown["value"] = c["get"]()
+                except Exception as error:  # noqa: BLE001
+                    shown["value"], shown["help"] = None, f"could not be read: {error}"
+            shown["can_change"] = (c["type"] == "action" or c.get("set") is not None) and self._can(member, c["needs"])
+            if c["type"] == "roles":
+                if roles is None:
+                    try:
+                        roles = ["@everyone"] + [r["name"] for r in self.request({"cmd": "server_info"}).get("roles", [])
+                                                 if not r.get("is_everyone")]
+                    except RuntimeError:
+                        roles = ["@everyone"]
+                shown["options"] = roles
+            if c["type"] == "channels":
+                shown["options"] = [{"id": rid, "title": info.get("title", "")} for rid, info in self.rooms.items()
+                                    if info.get("kind") == "channel"]
+            controls.append(shown)
+        return {"v": 1, "name": self.username, "title": self.display_name or self.username, "about": self.about or "",
+                "version": self.version, "controls": controls}
+
+    def _managed(self, data):
+        """Answers the app (or another program) asking about or changing this bot."""
+        room_id, kind, content = data.get("room_id", ""), data.get("type", ""), data.get("content") or {}
+        if self.rooms.get(room_id, {}).get("kind") != "direct":
+            return   # only in a chat with one person: what is shown depends on who asks
+        for prefix, fn in self._event_handlers:
+            if kind.startswith(prefix):
+                self._guard(fn, data)
+        if kind not in ("m.bot.describe", "m.bot.set", "m.bot.act"):
+            return
+        member = self._member(data.get("sender_user", ""))
+
+        def send(kind_out, body):
+            self.request({"cmd": "send_event", "room_id": room_id, "type": kind_out, "content": body,
+                          "fallback_text": "", "expires_in": 3600})
+        if kind != "m.bot.describe":
+            key = str(content.get("key", ""))
+            ok, said = self._change(member, kind, key, content.get("value"))
+            send("m.bot.result", {"ok": ok, "message": said, "key": key, "for": data.get("event_id", "")})
+        send("m.bot.description", dict(self._describe(member), **{"for": data.get("event_id", "")}))
+
+    def _change(self, member, kind, key, value):
+        """One change asked for from the app: (done, what to say)."""
+        who = (member or {}).get("username", "someone")
+        if key == "power" and kind == "m.bot.set":
+            if not self._can(member, "manage_bots"):
+                return False, "Only the owner, or someone whose role has Manage bots, can turn this bot off or on."
+            if bool(value) != self.enabled:
+                self.set_enabled(bool(value))
+                print(f"[{self.username}] turned {'on' if value else 'off'} by {who}", flush=True)
+            return True, "On." if value else "Off."
+        c = self._controls.get(key)
+        if not c or (kind == "m.bot.act") != (c["type"] == "action") or (c["type"] != "action" and c.get("set") is None):
+            return False, "That cannot be changed."
+        if not self._can(member, c["needs"]):
+            return False, "You may not change that."
+        try:
+            if c["type"] == "action":
+                said = c["run"]()
+                print(f"[{self.username}] {key} pressed by {who}", flush=True)
+                return True, said if isinstance(said, str) else "Done."
+            if c["type"] == "number":
+                value = int(value)
+                if "min" in c:
+                    value = max(int(c["min"]), value)
+                if "max" in c:
+                    value = min(int(c["max"]), value)
+            elif c["type"] == "switch":
+                value = bool(value)
+            elif c["type"] == "choice":
+                if value not in c.get("options", []):
+                    return False, "That is not one of the choices."
+            elif c["type"] == "text":
+                value = str(value)[:int(c.get("max", 500))]
+            elif c["type"] == "channels":
+                value = [r for r in (value or []) if r in self.rooms and self.rooms[r].get("kind") == "channel"]
+            elif c["type"] == "roles":
+                value = [str(r) for r in (value or [])]
+            c["set"](value)
+            print(f"[{self.username}] {key} set to {value!r} by {who}", flush=True)
+            return True, "Saved."
+        except Exception as error:  # noqa: BLE001
+            return False, f"That did not work: {error}"
 
     def members(self):
         """Everyone this bot shares a room with, itself left out: user id -> member."""
@@ -500,7 +682,12 @@ class Bot:
                     self._mine[data.get("event_id", "")] = data
                     while len(self._mine) > 200:
                         self._mine.popitem(last=False)
-                if data.get("shared_history") or data.get("type") not in ("m.text", "m.file"):
+                kind_of = data.get("type") or ""
+                if kind_of.startswith("m.bot.") and not data.get("mine") and not data.get("shared_history"):
+                    if not self._stale(data):
+                        threading.Thread(target=self._guard, args=(self._managed, data), daemon=True).start()
+                    continue
+                if data.get("shared_history") or kind_of not in ("m.text", "m.file"):
                     continue
                 direct = self.rooms.get(data.get("room_id", ""), {}).get("kind") == "direct"
                 message = Message(data, me=self.username, direct=direct)

@@ -144,6 +144,75 @@ def main():
         time.sleep(1.5)
         assert ahead == [0, 1, 2] and order == [0, 1, 2], (ahead, order)
         print("ok  bot kit: mentions, what a message answers, a file into a thread, one job at a time")
+        # A bot that can be managed from the app: it says what it has, and it alone decides who may change it.
+        kept = {"limit": 5, "pressed": 0}
+        managed = Bot(vault=os.path.join(tmp, "managed"), username="managed", about="For the test")
+        managed.version = "1.2.3"
+        managed.setting("limit", "number", "How many", get=lambda: kept["limit"],
+                        set=lambda v: kept.update(limit=v), min=0, max=50)
+        managed.setting("mood", "choice", "Mood", get=lambda: "calm", options=["calm", "wild"])   # shown, not changeable
+        managed.action("ring", "Ring the bell", run=lambda: kept.update(pressed=kept["pressed"] + 1) or "Rung.")
+        managed.permission("use", "May use it")
+        managed.info("since", "Up since", get=lambda: "just now")
+        managed.connect(address)
+        threading.Thread(target=managed.run, daemon=True).start()
+        time.sleep(3)
+
+        def app(person):
+            """What the app does: asks in the direct chat, and reads the answers."""
+            got = []
+            person.on_event("m.bot.")(lambda data: got.append(data))
+            room = person.dm("managed")
+
+            def ask(kind, **content):
+                del got[:]
+                person.request({"cmd": "send_event", "room_id": room, "type": kind, "content": content, "expires_in": 3600})
+                end = time.time() + 20
+                while time.time() < end:
+                    pages = [g["content"] for g in got if g["type"] == "m.bot.description"]
+                    if pages:
+                        results = [g["content"] for g in got if g["type"] == "m.bot.result"]
+                        return pages[-1], (results[-1] if results else None)
+                    time.sleep(0.2)
+                raise AssertionError(f"the bot did not answer {kind}")
+            return ask
+        as_owner, as_member = app(alice), app(carol)
+        page, _ = as_owner("m.bot.describe")
+        by_key = {c["key"]: c for c in page["controls"]}
+        assert page["v"] == 1 and page["version"] == "1.2.3" and page["about"] == "For the test"
+        assert list(by_key) == ["power", "limit", "mood", "ring", "permission:use", "since"], list(by_key)
+        assert by_key["limit"]["value"] == 5 and by_key["limit"]["can_change"] and by_key["limit"]["max"] == 50
+        assert not by_key["mood"]["can_change"] and not by_key["since"]["can_change"]
+        assert by_key["permission:use"]["value"] == ["@everyone"] and "@everyone" in by_key["permission:use"]["options"]
+        page, result = as_owner("m.bot.set", key="limit", value=70)
+        assert result["ok"] and kept["limit"] == 50, "a number is kept within its bounds"
+        assert {c["key"]: c for c in page["controls"]}["limit"]["value"] == 50
+        _, result = as_owner("m.bot.act", key="ring")
+        assert result["ok"] and result["message"] == "Rung." and kept["pressed"] == 1
+        _, result = as_owner("m.bot.set", key="mood", value="wild")
+        assert not result["ok"], "a value with no way to set it cannot be set"
+        # Someone without the right sees the page and can change nothing; the bot itself refuses.
+        page, _ = as_member("m.bot.describe")
+        assert not any(c["can_change"] for c in page["controls"]), page["controls"]
+        _, result = as_member("m.bot.set", key="limit", value=1)
+        assert not result["ok"] and kept["limit"] == 50
+        _, result = as_member("m.bot.act", key="ring")
+        assert not result["ok"] and kept["pressed"] == 1
+        _, result = as_member("m.bot.set", key="power", value=False)
+        assert not result["ok"] and managed.enabled
+        # A permission of the bot's own: everyone at first, then nobody but those who run it.
+        carol_id = next(m["user_id"] for m in alice.request({"cmd": "member_list"})["members"] if m["username"] == "carol")
+        alice_id = next(m["user_id"] for m in alice.request({"cmd": "member_list"})["members"] if m["username"] == "alice")
+        assert managed.allowed(carol_id, "use")
+        _, result = as_owner("m.bot.set", key="permission:use", value=[])
+        assert result["ok"] and not managed.allowed(carol_id, "use") and managed.allowed(alice_id, "use")
+        # Off and on from the page.
+        page, result = as_owner("m.bot.set", key="power", value=False)
+        assert result["ok"] and not managed.enabled and {c["key"]: c for c in page["controls"]}["power"]["value"] is False
+        as_owner("m.bot.set", key="power", value=True)
+        assert managed.enabled
+        print("ok  managing a bot: it describes its settings, buttons and permissions; changes are checked by the bot; "
+              "a member without the right changes nothing")
         print("PASS")
     finally:
         for p in started:
