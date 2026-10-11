@@ -110,6 +110,42 @@ first run are not counted as joining, and other bots never are.
 A bot does not hear other bots (two answering each other would never stop);
 `Bot(..., hear_bots=True)` changes that.
 
+## Installing a bot someone else wrote
+
+```sh
+git clone https://github.com/opencorded/bot-kit
+python3 bot-kit/install.py https://github.com/opencorded/bot-clips
+```
+
+It fetches the bot, shows what it is, what it needs and **exactly what its
+set-up script would run**, and asks before running anything. Then it says how
+to start the bot. With `--host path/to/host.json` it adds the bot (and any
+program it needs beside it) to a [Corded host](https://github.com/opencorded/host)'s
+list instead, so it starts with everything else. `--server` names the server
+it will join; `--vaults` where bot accounts are kept.
+
+A bot is someone else's program: installing it runs their script on your
+machine, and the bot then reads every message in the chats it is in. That is
+why this is done on the machine itself, by whoever runs it, and never from a
+chat.
+
+For your own bot to be installable this way, give it a `bot.json`:
+
+```json
+{
+  "name": "clips",
+  "title": "Clips",
+  "about": "Posts the video behind a link as a file",
+  "needs": {"programs": ["yt-dlp", "ffmpeg"]},
+  "setup": "setup.sh",
+  "start": ["python3", "-u", "video_bot.py", "{server}", "--vault", "{vault}"],
+  "companions": [{"name": "its-helper", "start": ["{folder}/helper"], "port": 9000}]
+}
+```
+
+`{server}`, `{vault}` and `{folder}` are filled in. What the bot's settings
+are is not written here: the bot says that itself, live (next section).
+
 ## Letting people manage your bot from the app
 
 In the app, tapping a bot in the members list offers **Manage**: a page with
