@@ -158,6 +158,32 @@ needs (`min`, `max`, `options`). What a person is shown depends on who they
 are, and **the bot checks every change itself**: a client that sends a change
 it should not is told no.
 
+## Bots asking bots
+
+A bot can offer something to other bots, and ask another bot for what it
+offers. Each still stands alone: neither needs the other to run.
+
+```python
+# the bot that offers
+@bot.offer("picture")
+def picture_for(args, asker, via):          # asker: the member it is for; via: the asking bot
+    if not asker or not bot.allowed(asker["user_id"], "use"):
+        return {"ok": False, "message": "they may not ask me for pictures"}
+    return {"file": make(args["prompt"]), "delete_after": True}
+
+# the bot that asks
+got = bot.ask_bot("pictures", "picture", {"prompt": "an owl"}, on_behalf_of=message.sender_id)
+if got["ok"]:
+    use(got["file"])
+```
+
+It is asked in the direct chat between the two bots (`m.bot.request` with
+`name`, `args`, `on_behalf_of`) and answered once (`m.bot.result` with `ok`,
+`message`, and `file_event` when a file was sent beside it). The asked bot
+applies its own rules to the person named. A request is never answered with a
+request, and bots go on ignoring each other's ordinary messages, so two bots
+cannot end up talking in circles.
+
 ## Where the kit looks for `corded-cli`
 
 `CORDED_CLI` if it is set; then beside the kit and one folder up (a Corded

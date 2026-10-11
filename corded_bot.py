@@ -127,7 +127,7 @@ def _preview(path, mime):
 # Commands that put a message in a room, and what a few others answer with.
 _SENDS = {"send_text": "m.text", "send_file": "m.file", "add_task": "m.task", "send_event": None}
 _ANSWERS = {"start_chat": "room", "get_profile": "profile", "member_list": "members", "fetch_timeline": "events",
-            "fetch_thread": "root"}
+            "fetch_thread": "root", "download_file": "path", "server_info": "roles"}
 
 
 class Bot:
@@ -166,6 +166,8 @@ class Bot:
         self._profile_handlers = []
         self._controls = collections.OrderedDict()   # what can be seen and changed from the app
         self._event_handlers = []
+        self._offers = {}                            # what other bots may ask this one for
+        self._asked = {}                             # request id -> where its answer is awaited
         self.version = ""                            # shown on the bot's page in the app, if set
         self._timers = []
         self._power_handlers = []
@@ -302,7 +304,7 @@ class Bot:
 
     def setting(self, key, kind, label, get, set=None, help="", needs="manage_bots", **more):
         """A value shown on the bot's page. kind: "number" (min=, max=),
-        "switch", "choice" (options=[...]), "text", or "channels" (a list of
+        "switch", "choice" (options=[...], or a function giving them), "text", or "channels" (a list of
         room ids). get() returns the value now; set(value) changes it, and
         without one the value is only shown. needs: who may change it:
         "manage_bots" (the owner and those with that permission), "owner",
@@ -318,6 +320,16 @@ class Bot:
     def info(self, key, label, get, help=""):
         """A line the bot shows about itself and nobody changes: a count, its uptime, its last error."""
         self._controls[key] = dict(key=key, type="info", label=label, help=help, get=get, set=None, needs="nobody")
+
+    def show_status(self):
+        """Adds to the bot's page how long it has been running. For a bot
+        whose operator wants that seen; a service run for others can leave
+        it out, and then nothing of the kind is told."""
+        def up():
+            seconds = int(time.time() - self._began)
+            days, hours, minutes = seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60
+            return (f"{days} d {hours} h" if days else f"{hours} h {minutes} min" if hours else f"{minutes} min")
+        self.info("uptime", "Running for", get=up)
 
     def permission(self, key, label, help="", default="everyone"):
         """A permission of the bot's own, like "may ask for pictures": on its
@@ -346,6 +358,88 @@ class Bot:
             return False
         return bool(member.get("is_owner")) or "manage_bots" in member.get("permissions", []) \
             or bool(held & set(member.get("roles", [])))
+
+    # ---- bots asking bots ----
+    #
+    # One bot can ask another for something the other offers: a chatbot asks
+    # a picture bot for a picture, say. It is asked in the direct chat between
+    # the two (m.bot.request), names the person it is asked for, and is
+    # answered once (m.bot.result), with a file if that is what was asked for.
+    # A request is never answered with a request, and bots still ignore each
+    # other's ordinary messages, so two bots cannot fall to talking in circles.
+
+    def offer(self, name, help=""):
+        """@bot.offer("picture") def picture(args, asker, via): ...
+        Something other bots may ask this one for. args is what they sent;
+        asker is the member it is for (None if nobody was named, or they are
+        not here); via is the asking bot's username. Check asker against your
+        own rules as you would the person themselves. Return a dict that goes
+        back as the answer; {"file": path} sends that file with it (and
+        "delete_after": True removes it once sent); raise or
+        return {"ok": False, "message": ...} to refuse."""
+        def register(fn):
+            self._offers[name] = (fn, help)
+            return fn
+        return register
+
+    def ask_bot(self, username, name, args=None, on_behalf_of="", timeout=600, save_to=None):
+        """Asks another bot for something it offers and waits for the answer:
+        a dict with "ok" and "message", and "file" (a path in save_to, or the
+        bot's own folder) when a file came back. on_behalf_of: the user id of
+        the person this is for, whose permissions the other bot will apply."""
+        room = self.request({"cmd": "start_chat", "username": username})["room"]
+        self.rooms[room["room_id"]] = room
+        waiting = queue.Queue()
+        sent = self.request({"cmd": "send_event", "room_id": room["room_id"], "type": "m.bot.request",
+                             "content": {"name": name, "args": args or {}, "on_behalf_of": on_behalf_of},
+                             "fallback_text": "", "expires_in": 3600})
+        asked = sent.get("event_id", "")
+        self._asked[asked] = waiting
+        try:
+            answer = waiting.get(timeout=timeout)
+        except queue.Empty:
+            return {"ok": False, "message": f"{username} did not answer"}
+        finally:
+            self._asked.pop(asked, None)
+        if answer.get("file_event"):
+            folder = save_to or os.path.join(self.vault, "received")
+            os.makedirs(folder, exist_ok=True)
+            try:
+                answer["file"] = self.request({"cmd": "download_file", "room_id": room["room_id"],
+                                               "event_id": answer["file_event"], "dir": folder}, timeout=600)["path"]
+            except RuntimeError as error:
+                return {"ok": False, "message": f"the file from {username} could not be fetched: {error}"}
+        return answer
+
+    def _asked_for(self, data):
+        """Another bot (or program) asks for something this bot offers."""
+        content, room_id = data.get("content") or {}, data.get("room_id", "")
+        name, asked = str(content.get("name", "")), data.get("event_id", "")
+
+        def answer(body):
+            self.request({"cmd": "send_event", "room_id": room_id, "type": "m.bot.result",
+                          "content": dict(body, **{"for": asked}), "fallback_text": "", "expires_in": 3600})
+        if name not in self._offers:
+            answer({"ok": False, "message": f"I do not offer \"{name}\"."})
+            return
+        asker = self._member(content.get("on_behalf_of", "")) if content.get("on_behalf_of") else None
+        via = (self._member(data.get("sender_user", "")) or {}).get("username", "")
+        try:
+            result = self._offers[name][0](content.get("args") or {}, asker, via)
+        except Exception as error:  # noqa: BLE001
+            answer({"ok": False, "message": str(error)})
+            return
+        result = dict(result) if isinstance(result, dict) else {"message": str(result or "")}
+        result.setdefault("ok", True)
+        path, throw_away = result.pop("file", None), result.pop("delete_after", False)
+        if path and result["ok"]:
+            try:
+                sent = self.send_file(room_id, path)
+                result["file_event"] = sent.get("event_id", "")
+            finally:
+                if throw_away and os.path.exists(path):
+                    os.remove(path)
+        answer(result)
 
     def on_event(self, prefix):
         """@bot.on_event("m.bot.") def got(data): ...   Called with the raw
@@ -383,7 +477,8 @@ class Bot:
                      "value": self.enabled, "can_change": self._can(member, "manage_bots")}]
         roles = None
         for key, c in self._controls.items():
-            shown = {k: v for k, v in c.items() if k not in ("get", "set", "run", "needs")}
+            shown = {k: (v() if k == "options" and callable(v) else v) for k, v in c.items()
+                     if k not in ("get", "set", "run", "needs")}
             if c["type"] != "action":
                 try:
                     shown["value"] = c["get"]()
@@ -413,6 +508,15 @@ class Bot:
         for prefix, fn in self._event_handlers:
             if kind.startswith(prefix):
                 self._guard(fn, data)
+        if kind == "m.bot.result":
+            waiting = self._asked.get(str(content.get("for", "")))
+            if waiting:
+                waiting.put(dict(content))
+            return
+        if kind == "m.bot.request":
+            if self.enabled:
+                self._asked_for(data)
+            return
         if kind not in ("m.bot.describe", "m.bot.set", "m.bot.act"):
             return
         member = self._member(data.get("sender_user", ""))
@@ -455,7 +559,8 @@ class Bot:
             elif c["type"] == "switch":
                 value = bool(value)
             elif c["type"] == "choice":
-                if value not in c.get("options", []):
+                options = c.get("options", [])
+                if value not in (options() if callable(options) else options):
                     return False, "That is not one of the choices."
             elif c["type"] == "text":
                 value = str(value)[:int(c.get("max", 500))]

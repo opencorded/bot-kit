@@ -213,6 +213,27 @@ def main():
         assert managed.enabled
         print("ok  managing a bot: it describes its settings, buttons and permissions; changes are checked by the bot; "
               "a member without the right changes nothing")
+        # One bot asks another for something it offers, for a person, and gets a file back.
+        handed = os.path.join(tmp, "handed.txt")
+        open(handed, "w").write("made to order")
+
+        @managed.offer("note")
+        def note_for(args, asker, via):
+            if not asker or asker["username"] != "alice":
+                return {"ok": False, "message": "only for alice"}
+            return {"file": handed, "message": f"for {asker['username']}, asked through {via}: {args.get('about')}"}
+        asking = Bot(vault=os.path.join(tmp, "asking"), username="asking")
+        asking.connect(address)
+        threading.Thread(target=asking.run, daemon=True).start()
+        time.sleep(3)
+        got = asking.ask_bot("managed", "note", {"about": "tea"}, on_behalf_of=alice_id, timeout=40)
+        assert got["ok"] and got["message"] == "for alice, asked through asking: tea", got
+        assert open(got["file"]).read() == "made to order"
+        refused = asking.ask_bot("managed", "note", {}, on_behalf_of=carol_id, timeout=40)
+        assert not refused["ok"] and refused["message"] == "only for alice" and "file" not in refused
+        unknown = asking.ask_bot("managed", "moon", timeout=40)
+        assert not unknown["ok"] and "do not offer" in unknown["message"]
+        print("ok  bots asking bots: asked for a named person, answered once, with a file; refused by the other's own rules")
         print("PASS")
     finally:
         for p in started:
